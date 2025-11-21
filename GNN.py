@@ -1,118 +1,90 @@
 import torch
-from torch import nn
-from torch_geometric.nn import aggr
-from torch.nn import ModuleList
-from torch.nn import CrossEntropyLoss
-softmax = torch.nn.LogSoftmax(dim=1)
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import (
+    GCNConv, SAGEConv, GINConv, GATConv,
+    BatchNorm, global_mean_pool
+)
 
-class ResidualGNNs(torch.nn.Module):
-    def __init__(self, args, train_dataset, hidden_channels, hidden, num_layers, GNN, k=0.6):
+class GNN3LayerBinary(nn.Module):
+    """
+    Three-layer GNN (+ MLP head) for binary graph classification.
+    - Supports: 'gcn', 'sage', 'gin', 'gat'
+    - Returns a single logit per graph.
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        hidden: int = 64,
+        conv_type: str = "gcn",
+        dropout: float = 0.5,
+        use_batchnorm: bool = True,
+        mlp_hidden: int = 64,
+        mlp_layers: int = 2,
+        gat_heads: int = 4,        # only used if conv_type='gat'
+    ):
         super().__init__()
-        self.convs = ModuleList()
-        self.aggr = aggr.MeanAggregation()
-        self.hidden_channels = hidden_channels
-        num_features = train_dataset.num_features
-        if args.model == "ChebConv":
-            if num_layers > 0:
-                self.convs.append(GNN(num_features, hidden_channels, K=5))
-                for i in range(0, num_layers - 1):
-                    self.convs.append(GNN(hidden_channels, hidden_channels, K=5))
+        self.dropout = dropout
+        self.use_bn = use_batchnorm
+        self.conv_type = conv_type.lower()
+
+        def make_conv(cin, cout):
+            if self.conv_type == "gcn":
+                return GCNConv(cin, cout, normalize=True)
+            if self.conv_type == "sage":
+                return SAGEConv(cin, cout)
+            if self.conv_type == "gin":
+                mlp = nn.Sequential(nn.Linear(cin, cout), nn.ReLU(), nn.Linear(cout, cout))
+                return GINConv(mlp)
+            if self.conv_type == "gat":
+                # multi-head; concat heads -> cout
+                head_dim = cout // gat_heads
+                assert head_dim * gat_heads == cout, "hidden must be divisible by gat_heads"
+                return GATConv(cin, head_dim, heads=gat_heads, concat=True, add_self_loops=True)
+            raise ValueError(f"Unknown conv_type: {conv_type}")
+
+        # 3 conv layers
+        self.conv1 = make_conv(in_channels, hidden)
+        self.conv2 = make_conv(hidden, hidden)
+        self.conv3 = make_conv(hidden, hidden)
+
+        # optional batch norms
+        if self.use_bn:
+            self.bn1 = BatchNorm(hidden)
+            self.bn2 = BatchNorm(hidden)
+            self.bn3 = BatchNorm(hidden)
+
+        # MLP head: hidden -> ... -> 1 logit
+        mlp = []
+        cin = hidden
+        for _ in range(max(mlp_layers - 1, 0)):
+            mlp += [nn.Linear(cin, mlp_hidden), nn.ReLU(), nn.Dropout(dropout)]
+            cin = mlp_hidden
+        mlp += [nn.Linear(cin, 1)]
+        self.mlp = nn.Sequential(*mlp)
+
+    def _block(self, x, conv, bn, edge_index, edge_weight=None):
+        if self.conv_type in ("gcn",):
+            x = conv(x, edge_index, edge_weight)
         else:
-            if num_layers > 0:
-                self.convs.append(GNN(num_features, hidden_channels))
-                for i in range(0, num_layers - 1):
-                    self.convs.append(GNN(hidden_channels, hidden_channels))
+            x = conv(x, edge_index)
+        if self.use_bn:
+            x = bn(x)
+        return F.relu(x)
 
-        input_dim1 = int(((num_features * num_features) / 2) - (num_features / 2) + (hidden_channels * num_layers))
-        input_dim = int(((num_features * num_features) / 2) - (num_features / 2))
-        self.bn = nn.BatchNorm1d(input_dim)
-        self.bnh = nn.BatchNorm1d(hidden_channels * num_layers)
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim1, hidden),
-            nn.BatchNorm1d(hidden),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hidden, hidden // 2),
-            nn.BatchNorm1d(hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hidden // 2, hidden // 2),
-            nn.BatchNorm1d(hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear((hidden // 2), args.num_classes),
-        )
+    def forward(self, x, edge_index, batch, edge_weight=None):
+        # 3 conv blocks
+        x = self._block(x, self.conv1, getattr(self, "bn1", None), edge_index, edge_weight)
+        x = F.dropout(x, p=self.dropout, training=self.training)
 
-    def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
-        xs = [x]
-        for conv in self.convs:
-            xs += [conv(xs[-1], edge_index).tanh()]
-        h = []
-        for i, xx in enumerate(xs):
-            if i == 0:
-                xx = xx.reshape(data.num_graphs, x.shape[1], -1)
-                x = torch.stack([t.triu().flatten()[t.triu().flatten().nonzero(as_tuple=True)] for t in xx])
-                x = self.bn(x)
-            else:
-                xx = self.aggr(xx, batch)
-                h.append(xx)
+        x = self._block(x, self.conv2, getattr(self, "bn2", None), edge_index, edge_weight)
+        x = F.dropout(x, p=self.dropout, training=self.training)
 
-        h = torch.cat(h, dim=1)
-        h = self.bnh(h)
-        x = torch.cat((x, h), dim=1)
-        x = self.mlp(x)
-        return softmax(x)
+        x = self._block(x, self.conv3, getattr(self, "bn3", None), edge_index, edge_weight)
 
-    # ---------- CrossEntropy (logits) variant ----------
-    def train_epoch(model, loader, optimizer, device):
-        """
-        Use this if model.forward returns *logits* (no softmax in forward).
-        """
-        model.train()
-        criterion = CrossEntropyLoss()
-        total_loss, total_correct, total_examples = 0.0, 0, 0
+        # graph-level pooling
+        x = global_mean_pool(x, batch)
 
-        for batch in loader:
-            batch = batch.to(device)
-            optimizer.zero_grad()
-
-            out = model(batch)  # shape [B, C] logits
-            y = batch.y.view(-1).long()  # ensure shape [B]
-            loss = criterion(out, y)
-
-            loss.backward()
-            optimizer.step()
-
-            total_loss += float(loss) * batch.num_graphs
-            preds = out.argmax(dim=1)
-            total_correct += (preds == y).sum().item()
-            total_examples += batch.num_graphs
-
-        avg_loss = total_loss / max(total_examples, 1)
-        acc = total_correct / max(total_examples, 1)
-        return avg_loss, acc
-
-    @torch.no_grad()
-    def eval_epoch(model, loader, device):
-        """
-        Eval if model.forward returns *logits*.
-        """
-        model.eval()
-        criterion = CrossEntropyLoss()
-        total_loss, total_correct, total_examples = 0.0, 0, 0
-
-        for batch in loader:
-            batch = batch.to(device)
-            out = model(batch)  # logits
-            y = batch.y.view(-1).long()
-            loss = criterion(out, y)
-
-            total_loss += float(loss) * batch.num_graphs
-            preds = out.argmax(dim=1)
-            total_correct += (preds == y).sum().item()
-            total_examples += batch.num_graphs
-
-        avg_loss = total_loss / max(total_examples, 1)
-        acc = total_correct / max(total_examples, 1)
-        return avg_loss, acc
+        # classification head -> single logit
+        logit = self.mlp(x).squeeze(-1)  # (batch_size,)
+        return logit
