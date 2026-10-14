@@ -425,6 +425,8 @@ def run_source_only_baseline(
     best_epoch = 0
     no_improve = 0
     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    # Per-epoch metrics on the held-out source split (only exists with early stopping).
+    val_history = {"epoch": [], "loss": [], "accuracy": [], "balanced_accuracy": []}
 
     for ep in range(1, epochs + 1):
         model.train()
@@ -437,19 +439,12 @@ def run_source_only_baseline(
             loss.backward()
             opt.step()
 
-        model.eval()
-        val_loss_sum = 0.0
-        val_count = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = batch.to(device)
-                logits = model(batch.x.float(), batch.edge_index, batch.batch)
-                y = batch.y.view(-1)
-                val_loss_sum += float(
-                    _classifier_loss(logits, y, num_classes, label_loss, reduction="sum").item()
-                )
-                val_count += y.numel()
-        val_loss = val_loss_sum / max(val_count, 1)
+        val_metrics = evaluate_classifier(model, val_loader, num_classes=num_classes, label_loss=label_loss)
+        val_loss = val_metrics["loss"]
+        if use_early_stopping:
+            val_history["epoch"].append(ep)
+            for key in ("loss", "accuracy", "balanced_accuracy"):
+                val_history[key].append(float(val_metrics[key]))
 
         if val_loss < (best_val_loss - min_delta):
             best_val_loss = val_loss
@@ -468,6 +463,10 @@ def run_source_only_baseline(
     metrics = {}
     metrics.update({f"source_{key}": value for key, value in source_metrics.items()})
     metrics.update({f"target_{key}": value for key, value in target_metrics.items()})
+    if use_early_stopping:
+        val_metrics = evaluate_classifier(model, val_loader, num_classes=num_classes, label_loss=label_loss)
+        metrics.update({f"source_val_{key}": value for key, value in val_metrics.items()})
+        metrics["source_val_history"] = val_history
     metrics["best_val_loss"] = best_val_loss
     metrics["best_epoch"] = best_epoch
     return model, metrics

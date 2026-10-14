@@ -63,6 +63,7 @@ class PipelineTest(unittest.TestCase):
         patches = [
             mock.patch.object(pipeline, "PROJECT_ROOT", tmp),
             mock.patch.object(pipeline, "COST_N_JOBS", 1),
+            mock.patch.object(pipeline, "SITE_GROUPS", {"LEUVEN": ["LEUVEN_1", "LEUVEN_2"], "USM": ["USM"]}),
             mock.patch.object(
                 pipeline,
                 "load_domain_graphs",
@@ -94,7 +95,29 @@ class PipelineTest(unittest.TestCase):
             metrics = mlflow.get_run(run.info.run_id).data.metrics
             self.assertIn("final_target_accuracy", metrics)
             self.assertIn("baseline_target_accuracy", metrics)
+            self.assertIn("baseline_source_val_accuracy", metrics)
+            self.assertIn("baseline_source_val_by_epoch_accuracy", metrics)
             self.assertTrue(pipeline.make_cost_path(_smoke_params(cost_type=cost_type)).exists())
+
+    def test_baseline_val_history_is_logged_per_epoch(self):
+        with mlflow.start_run() as run:
+            pipeline.run_experiment(_smoke_params(baseline_epochs=3, early_stopping_patience=10))
+
+        history = mlflow.MlflowClient().get_metric_history(run.info.run_id, "baseline_source_val_by_epoch_accuracy")
+        self.assertEqual([m.step for m in history], [1, 2, 3])
+
+    def test_label_shift_estimators_reweight_source_marginal(self):
+        for estimator in (None, "oracle", "ot"):
+            with self.subTest(estimator=estimator), mlflow.start_run() as run:
+                pipeline.run_experiment(_smoke_params(label_shift_estimator=estimator))
+
+            metrics = mlflow.get_run(run.info.run_id).data.metrics
+            self.assertIn("final_target_accuracy", metrics)
+            self.assertIn("label_shift_q_hat", metrics)
+            if estimator is None:
+                self.assertAlmostEqual(metrics["label_shift_q_hat"], metrics["label_shift_q_source"])
+            if estimator == "oracle":
+                self.assertAlmostEqual(metrics["label_shift_q_hat"], metrics["label_shift_q_star"])
 
     def test_reverse_direction_reuses_transposed_cache(self):
         params = _smoke_params(cost_type="frobenius")

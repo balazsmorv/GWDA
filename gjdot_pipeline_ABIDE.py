@@ -25,12 +25,19 @@ from GJDOT.gjdot_classifiers import (
     resolve_classifier_label_loss,
 )
 from GJDOT.gjdot_costs import load_or_compute_cost_matrix, normalize_graph_cost
+from GJDOT.gjdot_label_shift import source_marginal
+from GJDOT.gjdot_label_shift_pipeline import (
+    estimate_target_label_proportions,
+    label_shift_run_name_suffix,
+    log_label_shift_trajectory,
+)
 from GJDOT.gjdot_logging import (
     finite_values,
     log_class_label_stats,
     log_confusion_matrix,
     log_histogram,
     log_matrix_image,
+    log_metric_history,
     log_ot_marginal_violations,
     log_predicted_class_distribution,
     log_prefixed_metrics,
@@ -62,10 +69,10 @@ CLASS_LABELS = ["control", "ASD"]  # ABIDE DX_GROUP: 1 = ASD -> 1, 2 = control -
 # ABIDE SITE_ID values pooled into one domain.
 SITE_GROUPS = {
     "NYU": ["NYU"],
-    "UM": ["UM_1", "UM_2"],
+    # "UM": ["UM_1", "UM_2"],
     "USM": ["USM"],
-    "UCLA": ["UCLA_1", "UCLA_2"],
-    "LEUVEN": ["LEUVEN_1", "LEUVEN_2"],
+    # "UCLA": ["UCLA_1", "UCLA_2"],
+    # "LEUVEN": ["LEUVEN_1", "LEUVEN_2"],
 }
 
 # Dataset/domain grid.
@@ -84,8 +91,8 @@ MATRIX_FOLDERS = ["abide"]
 COST_TYPES = ["frobenius", "fgw"]  # "frobenius" or "fgw"
 FGW_ALPHAS = [0.5]  # only used by cost_type="fgw"
 COST_CLIP_PERCENTILES = [None]
-GRAPH_COST_NORMALIZATIONS = [None]  # None, "max" or "minmax"; makes jdot_alpha comparable across cost types
-NORMALIZE_OT_COST_VALUES = [False]  # divide the JDOT cost by its max before each OT solve (keeps Sinkhorn stable)
+GRAPH_COST_NORMALIZATIONS = ["minmax"]  # None, "max" or "minmax"; makes jdot_alpha comparable across cost types
+NORMALIZE_OT_COST_VALUES = [True]  # divide the JDOT cost by its max before each OT solve (keeps Sinkhorn stable)
 USE_SYMMETRIC_COST_CACHE_VALUES = [True]
 DEBUG_ORACLE_LABEL_LOSS = [False]
 COST_N_JOBS = -1  # joblib workers for the FGW cost matrix
@@ -100,22 +107,22 @@ MLP_LAYERS = [2]
 DROPOUTS = [0.0]
 BATCH_SIZES = [64]
 BASELINE_EPOCHS = [100]
-JDOT_FIT_EPOCHS = [50]
+JDOT_FIT_EPOCHS = [15]
 LRS = [1e-4]
-WEIGHT_DECAYS = [0.0]
+WEIGHT_DECAYS = [1e-4]
 BASELINE_USE_EARLY_STOPPING_VALUES = [True]
 EARLY_STOPPING_PATIENCES = [5]
 EARLY_STOPPING_MIN_DELTAS = [0.0]
-EARLY_STOPPING_VAL_RATIOS = [0.1]
+EARLY_STOPPING_VAL_RATIOS = [0.2]
 BCD_USE_EARLY_STOPPING_VALUES = [True]
-BCD_EARLY_STOPPING_VAL_RATIOS = [0.1]
+BCD_EARLY_STOPPING_VAL_RATIOS = [0.2]
 BCD_EARLY_STOPPING_PATIENCES = [5]
 BCD_EARLY_STOPPING_MIN_DELTAS = [0.0]
 
 # JDOT/OT grid.
-BCD_ITERS = [15]
+BCD_ITERS = [5]
 LOG_INSIDE_BCD = [True]
-JDOT_ALPHA = [10.0]  # weight of the (normalized) graph cost against the label loss; None = 1 / max(graph cost)
+JDOT_ALPHA = [1.0, 10.0, 100.0]  # weight of the (normalized) graph cost against the label loss; None = 1 / max(graph cost)
 
 LABEL_LOSSES = ["cross_entropy"]
 RESET_EACH_BCD_VALUES = [False]
@@ -128,6 +135,12 @@ SEMI_RELAXED = [False]
 UNBALANCED_REG_TYPES = ["kl"]
 USE_LABEL_REG_VALUES = [False]
 LABEL_REGS = [1e-1]
+
+# Label-shift grid. None = uniform source marginal (standard OT); an estimator
+# reweights the source marginal to its estimated target class proportions (once, before BCD).
+LABEL_SHIFT_ESTIMATORS = ["oracle"]  # Options: None, "oracle" (reads target labels; diagnostic only) and "ot"
+LABEL_SHIFT_DIAGNOSTICS = [True]
+LABEL_SHIFT_Q_GRID_POINTS = [101]  # points of the q grid in [0, 1] searched by the "ot" estimator
 
 CLASSIFIERS = ["gin"]
 
@@ -184,6 +197,9 @@ GRID = {
     "unbalanced_reg_type": UNBALANCED_REG_TYPES,
     "use_label_reg": USE_LABEL_REG_VALUES,
     "label_reg": LABEL_REGS,
+    "label_shift_estimator": LABEL_SHIFT_ESTIMATORS,
+    "label_shift_diagnostics": LABEL_SHIFT_DIAGNOSTICS,
+    "label_shift_q_grid_points": LABEL_SHIFT_Q_GRID_POINTS,
     "classifier": CLASSIFIERS,
 }
 
@@ -322,7 +338,7 @@ def make_run_name(params):
         f"sample={params['sample_mode']} "
         f"nclass={params['max_graphs_per_class']} "
         f"clip={params['cost_clip_percentile']}"
-    )
+    ) + label_shift_run_name_suffix(params)
 
 
 def log_run_params(params, cost_path, actual_in_dim, resolved_jdot_alpha, cost_loaded_from_transpose):
@@ -380,11 +396,18 @@ def run_experiment(params):
     log_matrix_image(cost_mtx, "Raw Graph Cost Matrix", "plots/raw_cost_matrix.png")
     log_matrix_image(cost_mtx_used, "Used Graph Cost Matrix", "plots/used_cost_matrix.png")
 
+    label_shift_pi_hat, _ = estimate_target_label_proportions(
+        params,
+        source_graphs=source_graphs,
+        target_graphs=target_graphs,
+        cost_mtx=cost_mtx_used,
+    )
+
     src_loader = DataLoader(source_graphs, batch_size=params["batch_size"], shuffle=False)
     tgt_loader = DataLoader(target_graphs, batch_size=params["batch_size"], shuffle=False)
 
     ys = np.array([int(g.y.item()) for g in source_graphs], dtype=np.float32).reshape(-1, 1)
-    w_s = ot.unif(len(source_graphs))
+    w_s = source_marginal(ys, pi_hat=label_shift_pi_hat)
     w_t = ot.unif(len(target_graphs))
 
     classifier = make_jdot_classifier(
@@ -398,6 +421,8 @@ def run_experiment(params):
     )
     baseline_metrics = classifier.baseline_metrics()
     log_prefixed_metrics("baseline", baseline_metrics)
+    if "source_val_history" in baseline_metrics:
+        log_metric_history("baseline_source_val_by_epoch", baseline_metrics["source_val_history"])
     log_confusion_matrix(
         {
             "confusion_matrix": baseline_metrics["target_confusion_matrix"],
@@ -414,6 +439,11 @@ def run_experiment(params):
     log_stats("initial_jdot_cost_matrix", jdot_cost_matrix)
     log_matrix_image(jdot_cost_matrix, "Initial JDOT Cost Matrix", "plots/initial_jdot_cost_matrix.png")
     log_matrix_image(label_loss_matrix, "Initial Label Loss Matrix", "plots/initial_label_loss_matrix.png")
+
+    # Class-1 share of the source marginal and of the classifier's target predictions, per BCD iteration.
+    source_is_class1 = ys.reshape(-1) == 1
+    q_marginal = [float(w_s[source_is_class1].sum())]
+    q_predicted = [float(np.mean(y_pred.reshape(-1) > 0.5))]
 
     gamma = None
     y_soft = None
@@ -434,6 +464,7 @@ def run_experiment(params):
             ot_cost, ot_cost_scale = jdot_cost_matrix, 1.0
         mlflow.log_metric("ot_cost_normalization_scale", float(ot_cost_scale), step=bcd_step)
         log_stats("ot_cost", ot_cost, step=bcd_step)
+        q_marginal.append(float(w_s[source_is_class1].sum()))
         gamma = solve_ot(params, w_s, w_t, ot_cost, ys=ys, numItermax=1000000)
         if gamma is None:
             mlflow.set_tag("skipped", "true")
@@ -466,6 +497,7 @@ def run_experiment(params):
         for metric_name, metric_value in compute_jdot_terms(gamma, cost_mtx_used, label_loss_matrix, jdot_alpha).items():
             mlflow.log_metric(metric_name, metric_value, step=bcd_step)
         log_predicted_class_distribution(y_pred, num_classes=2, step=bcd_step)
+        q_predicted.append(float(np.mean(y_pred.reshape(-1) > 0.5)))
 
         if params["log_inside_bcd"]:
             bcd_metrics = classifier.evaluate_target()
@@ -480,6 +512,14 @@ def run_experiment(params):
         mlflow.log_metric("pseudo_label_std", float(np.std(y_soft)), step=bcd_step)
         mlflow.log_metric("label_loss_mean", float(np.mean(label_loss_matrix)), step=bcd_step)
         mlflow.log_metric("jdot_cost_matrix_mean", float(np.mean(jdot_cost_matrix)), step=bcd_step)
+
+    log_label_shift_trajectory(
+        params,
+        np.array([int(g.y.item()) for g in source_graphs]),
+        np.array([int(g.y.item()) for g in target_graphs]),
+        q_marginal,
+        q_predicted,
+    )
 
     if params["log_inside_bcd"]:
         mlflow.log_dict(
