@@ -54,6 +54,7 @@ from GJDOT.gjdot_utils import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+# Start mlflow: .venv/bin/mlflow ui --backend-store-uri sqlite:///mlflow.db
 TRACKING_URI = f"sqlite:///{PROJECT_ROOT / 'mlflow.db'}"
 EXPERIMENT_NAME = f"GJDOT_ABIDE_{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
 CLASS_LABELS = ["control", "ASD"]  # ABIDE DX_GROUP: 1 = ASD -> 1, 2 = control -> 0
@@ -83,8 +84,8 @@ MATRIX_FOLDERS = ["abide"]
 COST_TYPES = ["frobenius", "fgw"]  # "frobenius" or "fgw"
 FGW_ALPHAS = [0.5]  # only used by cost_type="fgw"
 COST_CLIP_PERCENTILES = [None]
-GRAPH_COST_NORMALIZATIONS = ["minmax"]  # None, "max" or "minmax"; makes jdot_alpha comparable across cost types
-NORMALIZE_OT_COST_VALUES = [True]  # divide the JDOT cost by its max before each OT solve (keeps Sinkhorn stable)
+GRAPH_COST_NORMALIZATIONS = [None]  # None, "max" or "minmax"; makes jdot_alpha comparable across cost types
+NORMALIZE_OT_COST_VALUES = [False]  # divide the JDOT cost by its max before each OT solve (keeps Sinkhorn stable)
 USE_SYMMETRIC_COST_CACHE_VALUES = [True]
 DEBUG_ORACLE_LABEL_LOSS = [False]
 COST_N_JOBS = -1  # joblib workers for the FGW cost matrix
@@ -119,7 +120,7 @@ JDOT_ALPHA = [10.0]  # weight of the (normalized) graph cost against the label l
 LABEL_LOSSES = ["cross_entropy"]
 RESET_EACH_BCD_VALUES = [False]
 RESET_TO_SOURCE_PRETRAINED_VALUES = [False]  # official JDOT uses false
-USE_ENTROPY_REG_VALUES = [True]
+USE_ENTROPY_REG_VALUES = [False]
 ENTROPY_REGS = [0.05]
 USE_UNBALANCED_VALUES = [False]  # only takes effect with use_entropy_reg=False
 UNBALANCED_REGS = [1.0]
