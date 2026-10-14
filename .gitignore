@@ -178,3 +178,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+
+# GJDOT experiment outputs and downloaded data
+mlflow.db
+mlruns/
+cost_matrices/
+data/nilearn_data/
