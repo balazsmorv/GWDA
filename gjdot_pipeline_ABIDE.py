@@ -72,8 +72,8 @@ DATA_DIRS = [PROJECT_ROOT / "data" / "nilearn_data"]
 DERIVATIVES = ["rois_cc200"]  # ABIDE PCP atlas time series (CPAC, band-pass, GSR, quality checked)
 EDGE_TOP_PERCENTS = [10.0]  # strongest positive correlations kept as GNN edges
 NODE_FEATURE_MODES = ["corr_row"]  # "corr_row" (connectivity profile) or "ones"
-SOURCE_DOMAINS = ["LEUVEN", "USM"]
-TARGET_DOMAINS = ["LEUVEN", "USM"]
+SOURCE_DOMAINS = list(SITE_GROUPS)  # all ordered site pairs; source == target is skipped
+TARGET_DOMAINS = list(SITE_GROUPS)
 SAMPLE_MODES = ["full"]  # "full" or "stratified"
 MAX_GRAPHS_PER_CLASS = [None]
 SAMPLE_SEEDS = [42]
